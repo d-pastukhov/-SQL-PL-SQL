@@ -1,0 +1,136 @@
+ --удаление всех таблиц
+drop table FACT_OPER;
+drop table PLAN_OPER;
+drop table PR_CRED;
+drop table CLIENT;
+
+--создание таблицы "Клиенты"
+    create table CLIENT    ( 
+    ID          number(25),	
+    CONSTRAINT  client_id_pk   PRIMARY KEY (ID), 
+    CL_NAME		varchar2(100), 
+    DATE_BIRTH	date
+    ) ;
+    
+    --создание таблицы "Кредитные договоры"
+    create table PR_CRED    ( 
+    ID			number(25),	
+    CONSTRAINT  pr_cred_id_pk   PRIMARY KEY (ID), 
+    NUM_DOG		varchar2(20), 
+    SUMMA_DOG	number, 
+    DATE_BEGIN	date, 
+    DATE_END	date, 
+    ID_CLIENT	number(25),	
+    CONSTRAINT	pr_cred_id_client_fk   FOREIGN KEY (ID_CLIENT)
+        REFERENCES CLIENT (ID), 
+    COLLECT_PLAN number(25),
+    CONSTRAINT pr_cred_col_plan_unique UNIQUE (COLLECT_PLAN), 
+    COLLECT_FACT number(25),
+    CONSTRAINT pr_cred_col_fact_unique UNIQUE (COLLECT_FACT)
+	) ;
+	
+--создание таблицы "Плановые операции"
+    create table PLAN_OPER ( 
+    COLLECTION_ID	number(25),
+    CONSTRAINT plan_oper_col_id_fk FOREIGN KEY (COLLECTION_ID) 
+        references pr_cred (collect_plan), 
+    P_DATE		date, 
+    P_SUMMA		number, 
+    TYPE_OPER	varchar2(40)
+    ) ;
+
+--создание таблицы "Фактические операции"	
+    create table FACT_OPER    ( 
+    COLLECTION_ID	number(25),
+    CONSTRAINT fact_oper_col_id_fk FOREIGN KEY (collection_id) 
+    REFERENCES pr_cred (collect_fact), 
+    F_DATE		date, 
+    F_SUMMA		number, 
+    TYPE_OPER	varchar2(40)
+    ) ;
+
+--Удаление функций и представления	
+drop function Loan_balance;
+drop function Calculate_of_percent;
+drop view Portfolio_condition;
+
+--Создание функции "Остаток_ссудной_задолженности_на_дату"
+create or replace function Loan_balance(
+    client_id in number, -- ID клиента
+    number_dog in varchar2, -- Номер договора клиента (у одного клиента может быть несколько договоров)
+    date_report in date) -- Дата для формирования отчета
+    return number
+is
+    Loan_bal number := 0;
+begin
+    select p.summa_dog - sum(f.f_summa) into Loan_bal
+    from fact_oper f, pr_cred p
+    where f.collection_id = p.collect_fact
+        and p.id_client = client_id
+        and p.num_dog = number_dog
+        and f.type_oper = 'Погашение кредита'
+        and f.f_date <= date_report
+    group by p.num_dog, p.summa_dog;
+    
+    return Loan_bal; 
+exception
+    when no_data_found then
+    begin
+         select p.summa_dog into Loan_bal
+                from pr_cred p
+         where p.id_client = client_id 
+           and p.num_dog = number_dog;
+         return Loan_bal;
+    end;
+end;
+/
+
+--Создание функции "Сумма_предстоящих_процентов_к_погашению"
+create or replace function calculate_of_percent(
+    client_id in number, -- ID клиента
+    number_dog in varchar2, -- Номер договора клиента
+    date_report in date) -- Дата для формирования отчета
+    return number
+is
+    p_sumf number := 0;
+    f_sumf number := 0;
+begin
+    select sum(po.p_summa) into p_sumf
+    from plan_oper po, pr_cred pc
+    where po.collection_id = pc.collect_plan
+        and po.type_oper = 'Погашение процентов'
+        and pc.id_client = client_id
+        and pc.num_dog = number_dog
+    group by pc.num_dog;
+    
+    select sum(f.f_summa) into f_sumf
+    from fact_oper f, pr_cred p
+    where f.collection_id = p.collect_fact
+        and f.type_oper = 'Погашение процентов'
+        and f.f_date <= to_date(date_report)
+        and p.id_client = client_id
+        and p.num_dog = number_dog
+    group by p.num_dog;
+    
+    return (p_sumf - f_sumf);
+exception
+    when no_data_found then
+    return p_sumf;   
+end;
+/
+
+--Создание представления "Отчет о состоянии кредитного портфеля на заданную дату"
+create or replace view portfolio_condition as
+    select  p.num_dog Num_Dog, 
+            c.cl_name FIO, 
+            p.summa_dog Sum_Dog, 
+            p.date_begin Date_Begin, 
+            p.date_end Date_End, 
+            cast ((Loan_balance (c.id, p.num_dog, '&date_report_Loan_balance')) as numeric (10, 2)) Loan_balance_as_of_date, --"Остаток_ссудной_задолженности_на_дату"
+            cast ((calculate_of_percent (c.id, p.num_dog, '&date_report_Amount_Interest')) as numeric (10, 2)) Amount_of_Upcoming_Interest_to_Maturity, --"Сумма_предстоящих_процентов_к_погашению"
+            to_char(sysdate, 'dd.mm.yy hh24:mi:ss') Date_time_of_report_generation
+    from pr_cred p, client c
+    where p.id_client = c.id
+    and p.date_begin <= '&date_report';
+        
+select * from portfolio_condition order by FIO
